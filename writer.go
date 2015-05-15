@@ -15,11 +15,11 @@ import (
 type Writer struct {
 	conn  *kinesis.Kinesis
 	name  string
-	wait  time.Duration
 	delay int
 
 	queue  *queue
 	logger Logger
+	stats  writerStats
 
 	mu      sync.Mutex
 	wg      sync.WaitGroup
@@ -30,7 +30,6 @@ func NewWriter(conn *kinesis.Kinesis, name string) *Writer {
 	w := &Writer{}
 	w.conn = conn
 	w.name = name
-	w.wait = 1 * time.Second
 	w.delay = 0
 	w.queue = &queue{}
 	w.logger = nil
@@ -55,7 +54,7 @@ func (w *Writer) runFlusher() {
 	w.mu.Unlock()
 
 	if !r {
-		w.debugf("waikup flusher")
+		w.debugf("wakeup flusher")
 		w.wg.Add(1)
 		go w.flusher()
 	}
@@ -65,12 +64,13 @@ func (w *Writer) flusher() {
 	w.debugf("flusher start")
 
 	for {
-		w.debugf("wait %d seconds", int(w.wait/time.Second))
-		<-time.After(w.wait)
+		wait := (w.delay * w.delay) + 1
+		w.debugf("wait %d seconds", wait)
+		<-time.After(time.Duration(wait) * time.Second)
 
-		w.logStats()
-		w.Flush()
-		w.logStats()
+		//w.logStats()
+		w.flush()
+		//w.logStats()
 
 		if w.queue.empty() {
 			w.debugf("empty")
@@ -82,6 +82,10 @@ func (w *Writer) flusher() {
 	w.running = false
 	w.mu.Unlock()
 
+	if !w.queue.empty() {
+		w.runFlusher()
+	}
+
 	w.debugf("flusher end")
 	w.wg.Done()
 }
@@ -90,8 +94,36 @@ func (w *Writer) Wait() {
 	w.wg.Wait()
 }
 
-func (w *Writer) Flush() {
+func (w *Writer) flush() {
+	start := time.Now()
+	beforeCount := w.stats.Count()
+
+	w.updateRemainingCount()
+
+	noErr := w.flushQueue()
+
+	elapsed := time.Now().Sub(start)
+	w.stats.setLatency(elapsed)
+
+	afterCount := w.stats.Count()
+	throughput := float64(beforeCount - afterCount)
+	if elapsed > time.Second {
+		throughput /= elapsed.Seconds()
+	}
+	w.stats.setThroughput(throughput)
+
+	w.updateRemainingCount()
+
+	if noErr {
+		w.delay = 0
+	} else {
+		w.delay += 1
+	}
+}
+
+func (w *Writer) flushQueue() bool {
 	var errCnt int32 = 0
+
 	var wg sync.WaitGroup
 	for {
 		c := w.queue.popChunk()
@@ -100,7 +132,7 @@ func (w *Writer) Flush() {
 			break
 		}
 
-		if c.entries == nil || len(c.entries) <= 0 {
+		if len(c.entries) <= 0 {
 			panic("no entries")
 		}
 
@@ -116,13 +148,15 @@ func (w *Writer) Flush() {
 	}
 	wg.Wait()
 
-	if errCnt > 0 {
-		w.delay += 1
-	} else {
-		w.delay = 0
-	}
+	return errCnt <= 0
+}
 
-	w.wait = time.Second * time.Duration((w.delay*w.delay)+1)
+func (w *Writer) Stats() WriterStats {
+	return &w.stats
+}
+
+func (w *Writer) updateRemainingCount() {
+	w.stats.setRemainingCount(int64(w.queue.count()))
 }
 
 func (w *Writer) putRecords(c *chunk) bool {
@@ -136,11 +170,15 @@ func (w *Writer) putRecords(c *chunk) bool {
 
 func (w *Writer) handleResponse(c *chunk, resp *kinesis.PutRecordsOutput, err error) bool {
 	if err != nil {
+		var cnt int64 = int64(len(c.entries))
+		w.stats.incrFailedCount(cnt)
+
 		if awserr := aws.Error(err); awserr != nil {
 			if 500 <= awserr.StatusCode && awserr.StatusCode <= 599 {
 				// temporary error. retry all
 				w.warnf("%d %s", awserr.StatusCode, awserr.Error())
 				w.queue.pushChunk(c)
+				w.stats.incrRetriedCount(cnt)
 				return false
 			} else if awserr.StatusCode != 200 {
 				// 400 or other error. should not retry
@@ -151,6 +189,7 @@ func (w *Writer) handleResponse(c *chunk, resp *kinesis.PutRecordsOutput, err er
 			// internal error. retry all
 			w.errorf(err.Error())
 			w.queue.pushChunk(c)
+			w.stats.incrRetriedCount(cnt)
 			return false
 		}
 	}
@@ -174,10 +213,15 @@ func (w *Writer) handleOutput(entries []*kinesis.PutRecordsRequestEntry, resp *k
 	failedCount := *resp.FailedRecordCount
 	succeededCount := len(entries) - int(failedCount)
 
-	count := w.handleResults(entries, resp.Records)
-	w.infof("put %d, failed %d, retry %d", succeededCount, failedCount, count)
+	w.stats.incrCount(int64(succeededCount))
 
-	if failedCount > 0 || count > 0 {
+	retriedCount := w.handleResults(entries, resp.Records)
+	w.infof("put %d, failed %d, retry %d", succeededCount, failedCount, retriedCount)
+
+	if failedCount > 0 || retriedCount > 0 {
+		// update stats
+		w.stats.incrFailedCount(int64(failedCount))
+		w.stats.incrRetriedCount(int64(retriedCount))
 		return false
 	}
 
@@ -191,24 +235,30 @@ func (w *Writer) handleResults(entries []*kinesis.PutRecordsRequestEntry, result
 		return 0
 	}
 
-	count := 0
+	sentBytes := 0
+	retriedCount := 0
 	for i, r := range results {
 		if r != nil {
+			entry := entries[i]
 			code := stringValue(r.ErrorCode)
 			msg := stringValue(r.ErrorMessage)
 			if code != "" {
 				w.infof("%s: %s", code, msg)
-				entry := entries[i]
 				w.queue.addEntry(entry)
-				count += 1
+				retriedCount += 1
 			} else {
 				seq := stringValue(r.SequenceNumber)
 				shard := stringValue(r.ShardID)
 				w.verbosef("%s to %s", seq, shard)
+				sentBytes += len(entry.Data)
 			}
 		}
 	}
-	return count
+
+	// update stats
+	w.stats.incrBytes(int64(sentBytes))
+
+	return retriedCount
 }
 
 func (w *Writer) logStats() {
@@ -251,6 +301,97 @@ func (w *Writer) criticalf(format string, v ...interface{}) {
 	if w.logger != nil {
 		w.logger.Criticalf(format, v...)
 	}
+}
+
+type WriterStats interface {
+	// The number of total rows were sent to Kinesis
+	Count() int64
+
+	// The number of total bytes were sent to Kinesis
+	Bytes() int64
+
+	// The number of total failued record count
+	FailedCount() int64
+
+	// The number of total retries count
+	RetriedCount() int64
+
+	// The number of rows in the writer
+	RemainingCount() int64
+
+	// The last latency of Kinesis
+	Latency() time.Duration
+
+	// The throughput
+	Throughput() float64
+}
+
+type writerStats struct {
+	count          int64
+	bytes          int64
+	failedCount    int64
+	retriedCount   int64
+	remainingCount int64
+	latency        int64
+	throughput     int64
+}
+
+func (s *writerStats) Count() int64 {
+	return atomic.LoadInt64(&s.count)
+}
+
+func (s *writerStats) Bytes() int64 {
+	return atomic.LoadInt64(&s.bytes)
+}
+
+func (s *writerStats) FailedCount() int64 {
+	return atomic.LoadInt64(&s.failedCount)
+}
+
+func (s *writerStats) RetriedCount() int64 {
+	return atomic.LoadInt64(&s.retriedCount)
+}
+
+func (s *writerStats) RemainingCount() int64 {
+	return atomic.LoadInt64(&s.remainingCount)
+}
+
+func (s *writerStats) Latency() time.Duration {
+	v := atomic.LoadInt64(&s.latency)
+	return time.Duration(v)
+}
+
+func (s *writerStats) Throughput() float64 {
+	v := atomic.LoadInt64(&s.throughput)
+	return float64(v / 1000000)
+}
+
+func (s *writerStats) incrCount(value int64) {
+	atomic.AddInt64(&s.count, value)
+}
+
+func (s *writerStats) incrBytes(value int64) {
+	atomic.AddInt64(&s.bytes, value)
+}
+
+func (s *writerStats) incrFailedCount(value int64) {
+	atomic.AddInt64(&s.failedCount, value)
+}
+
+func (s *writerStats) incrRetriedCount(value int64) {
+	atomic.AddInt64(&s.retriedCount, value)
+}
+
+func (s *writerStats) setRemainingCount(value int64) {
+	atomic.StoreInt64(&s.remainingCount, value)
+}
+
+func (s *writerStats) setLatency(value time.Duration) {
+	atomic.StoreInt64(&s.latency, value.Nanoseconds())
+}
+
+func (s *writerStats) setThroughput(value float64) {
+	atomic.StoreInt64(&s.throughput, int64(value*1000000))
 }
 
 type chunk struct {
@@ -296,12 +437,15 @@ func (c *chunk) ready() bool {
 }
 
 type queue struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	chunks []*chunk
 }
 
 func (q *queue) empty() bool {
-	return len(q.chunks) <= 0
+	q.mu.RLock()
+	n := len(q.chunks)
+	q.mu.RUnlock()
+	return n <= 0
 }
 
 func (q *queue) popChunk() *chunk {
@@ -364,11 +508,19 @@ func (q *queue) addEntry(entry *kinesis.PutRecordsRequestEntry) error {
 	return nil
 }
 
-func (q *queue) stats() string {
-	q.mu.Lock()
-	defer q.mu.Unlock()
+func (q *queue) count() int {
+	q.mu.RLock()
+	var ret int = 0
+	for _, c := range q.chunks {
+		ret += len(c.entries)
+	}
+	q.mu.RUnlock()
+	return ret
+}
 
+func (q *queue) stats() string {
 	var buf bytes.Buffer
+	q.mu.RLock()
 	buf.WriteString(fmt.Sprintf("%d chunks [", len(q.chunks)))
 	for i, c := range q.chunks {
 		if i != 0 {
@@ -376,6 +528,7 @@ func (q *queue) stats() string {
 		}
 		buf.WriteString(fmt.Sprintf("{%d, %d}", len(c.entries), c.size))
 	}
+	q.mu.RUnlock()
 	buf.WriteString("]")
 	return buf.String()
 }
